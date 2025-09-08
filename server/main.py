@@ -6,8 +6,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 import aiohttp
 import os, random
+import pathlib
 from dotenv import load_dotenv
-from typing import Literal
+from typing import Literal, Optional
 from .github_client import GitHubClient
 
 load_dotenv()
@@ -17,6 +18,10 @@ PROTOCOL = "2025-06-18"
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")
 SERVER_INFO = {"name": os.getenv("MCP_SERVER_NAME", "vgc-remote"),
                "version": os.getenv("MCP_SERVER_VERSION", "0.1.0")}
+
+FILES_ROOT = os.getenv("FILES_ROOT", os.path.expanduser("~/mcp_files"))
+FILES_ROOT_PATH = pathlib.Path(FILES_ROOT).resolve()
+FILES_ROOT_PATH.mkdir(parents=True, exist_ok=True) 
 
 # Definición de herramientas
 TOOLS = [
@@ -128,6 +133,33 @@ TOOLS = [
             "additionalProperties": False
         }
     },
+    {
+        "name": "files_list",
+        "description": "Lista entradas dentro de un directorio bajo una raíz segura.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Ruta relativa dentro de la raíz", "default": "."},
+                "recursive": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200}
+            },
+            "additionalProperties": False
+        }
+    },
+    {
+        "name": "files_read",
+        "description": "Lee el contenido de un archivo de texto bajo la raíz segura (soporta offset/limit).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536}
+            },
+            "required": ["path"],
+            "additionalProperties": False
+        }
+    },
 ]
 
 POKEDEX = [
@@ -189,6 +221,17 @@ def handle_tool(name: str, args: dict):
     # herramienta desconocida
     return {"content": [{"type": "text", "text": f"Herramienta desconocida: {name}"}]}
 
+class FilesListArgs(BaseModel):
+    path: str = "."
+    recursive: bool = False
+    limit: int = Field(default=200, ge=1, le=5000)
+
+class FilesReadArgs(BaseModel):
+    path: str
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=65536, ge=1, le=1048576)
+
+
 # Utilidades JSON-RPC
 def jsonrpc_result(id_, result):
     return {"jsonrpc": "2.0", "id": id_, "result": result}
@@ -209,6 +252,16 @@ def mcp_text_result(text: str, data=None) -> dict:
     if data is not None:
         res["data"] = data
     return res
+
+def _resolve_safe(path_str: str) -> pathlib.Path:
+    """
+    Resuelve path relativo a FILES_ROOT y evita traversal fuera de la raíz.
+    """
+    rel = pathlib.Path(path_str.strip("/\\"))
+    p = (FILES_ROOT_PATH / rel).resolve()
+    if not str(p).startswith(str(FILES_ROOT_PATH)):
+        raise PermissionError("Path fuera de FILES_ROOT")
+    return p
 
 # Endpoints
 @app.get("/healthz")
@@ -263,7 +316,7 @@ async def rpc(req: Request):
                 a = RepoInfoArgs(**arguments)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     data = await gh.repo_summary(session, a.owner, a.repo)
-                text = (f"{data['full_name']} — ⭐ {data['stars']} | 🍴 {data['forks']} | "
+                text = (f"{data['full_name']} — {data['stars']} | 🍴 {data['forks']} | "
                         f"issues {data['open_issues']} | default: {data['default_branch']}")
                 return JSONResponse(jsonrpc_result(id_, mcp_text_result(text, data)))
 
@@ -321,6 +374,68 @@ async def rpc(req: Request):
                 text = (f"Diff {a.base}...{a.head} — ahead {comp['ahead_by']}, behind {comp['behind_by']}, "
                         f"commits {comp['total_commits']}\n{first}{more}")
                 return JSONResponse(jsonrpc_result(id_, mcp_text_result(text, comp)))
+            
+            elif name == "files_list":
+                a = FilesListArgs(**arguments)
+                target = _resolve_safe(a.path)
+                if not target.exists():
+                    return JSONResponse(jsonrpc_error(id_, code=-32000, message=f"No existe: {a.path}"), status_code=404)
+                if not target.is_dir():
+                    return JSONResponse(jsonrpc_error(id_, code=-32000, message=f"No es directorio: {a.path}"), status_code=400)
+
+                entries = []
+                count = 0
+                if a.recursive:
+                    for root, dirs, files in os.walk(target):
+                        for d in dirs:
+                            p = pathlib.Path(root) / d
+                            rel = str(p.relative_to(FILES_ROOT_PATH))
+                            stat = p.stat()
+                            entries.append({"path": rel, "is_dir": True, "size": stat.st_size})
+                            count += 1
+                            if count >= a.limit: break
+                        if count >= a.limit: break
+                        for f in files:
+                            p = pathlib.Path(root) / f
+                            rel = str(p.relative_to(FILES_ROOT_PATH))
+                            stat = p.stat()
+                            entries.append({"path": rel, "is_dir": False, "size": stat.st_size})
+                            count += 1
+                            if count >= a.limit: break
+                        if count >= a.limit: break
+                else:
+                    for p in target.iterdir():
+                        rel = str(p.relative_to(FILES_ROOT_PATH))
+                        stat = p.stat()
+                        entries.append({"path": rel, "is_dir": p.is_dir(), "size": stat.st_size})
+                        count += 1
+                        if count >= a.limit: break
+
+                txt_lines = [f"[DIR] {e['path']}" if e["is_dir"] else f"      {e['path']} ({e['size']} bytes)" for e in entries[:20]]
+                more = "" if len(entries) <= 20 else f"\n… y {len(entries)-20} más"
+                text = f"Listado de {a.path} (root={FILES_ROOT}):\n" + ("\n".join(txt_lines) if txt_lines else "— vacío —") + more
+                return JSONResponse(jsonrpc_result(id_, mcp_text_result(text, entries)))
+
+            elif name == "files_read":
+                a = FilesReadArgs(**arguments)
+                p = _resolve_safe(a.path)
+                if not p.exists():
+                    return JSONResponse(jsonrpc_error(id_, code=-32000, message=f"No existe: {a.path}"), status_code=404)
+                if not p.is_file():
+                    return JSONResponse(jsonrpc_error(id_, code=-32000, message=f"No es archivo: {a.path}"), status_code=400)
+
+                data = p.read_bytes()
+                size = len(data)
+                start = min(a.offset, size)
+                end = min(start + a.limit, size)
+                chunk = data[start:end].decode("utf-8", errors="replace")
+                eof = (end >= size)
+
+                preview = chunk[:500]
+                tail = "" if len(chunk) <= 500 else "\n…(truncado)"
+                text = f"{a.path} [{start}:{end}/{size}] eof={eof}\n{preview}{tail}"
+                payload = {"path": a.path, "offset": start, "end": end, "size": size, "eof": eof, "content": chunk}
+                return JSONResponse(jsonrpc_result(id_, mcp_text_result(text, payload)))
 
             else:
                 return JSONResponse(jsonrpc_error(id_, code=-32601, message=f"Tool not found: {name}"), status_code=400)
