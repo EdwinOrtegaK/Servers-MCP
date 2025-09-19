@@ -264,7 +264,7 @@ def _resolve_safe(path_str: str) -> pathlib.Path:
     return p
 
 # Endpoints
-@app.get("/healthz")
+@app.get("/health")
 def health():
     return {"ok": True, "server": SERVER_INFO}
 
